@@ -3,13 +3,15 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Paper-only SOL/USDC market analysis and simulated trading API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: sol-scalper
+    description: SOL/USDC paper trading
 paths:
   /healthz:
     get:
@@ -24,6 +26,112 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /bot/dashboard:
+    get:
+      operationId: getBotDashboard
+      tags: [sol-scalper]
+      summary: Get live dashboard
+      description: Fetches public SOL/USDC market data, calculates indicators, evaluates paper risk controls, and returns the latest dashboard state.
+      responses:
+        "200":
+          description: Dashboard data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotDashboard"
+        "503":
+          description: Public market data is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /bot/signals:
+    get:
+      operationId: getBotSignals
+      tags: [sol-scalper]
+      summary: List recent signals
+      responses:
+        "200":
+          description: Recent paper strategy signals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Signal"
+  /bot/trades:
+    get:
+      operationId: getBotTrades
+      tags: [sol-scalper]
+      summary: List simulated trades
+      responses:
+        "200":
+          description: Recent simulated positions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Trade"
+  /bot/settings:
+    get:
+      operationId: getBotSettings
+      tags: [sol-scalper]
+      summary: Get paper risk settings
+      responses:
+        "200":
+          description: Current paper risk settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotSettings"
+    patch:
+      operationId: updateBotSettings
+      tags: [sol-scalper]
+      summary: Update paper risk settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotSettingsInput"
+      responses:
+        "200":
+          description: Updated paper risk settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotSettings"
+        "400":
+          description: Invalid settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /bot/control:
+    post:
+      operationId: setBotRunning
+      tags: [sol-scalper]
+      summary: Start or pause the paper simulator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotControlInput"
+      responses:
+        "200":
+          description: Updated paper bot status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+        "400":
+          description: Unable to start paper bot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +141,137 @@ components:
           type: string
       required:
         - status
-
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+    Candle:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+        open: { type: number }
+        high: { type: number }
+        low: { type: number }
+        close: { type: number }
+        volume: { type: number }
+      required: [timestamp, open, high, low, close, volume]
+    IndicatorSnapshot:
+      type: object
+      properties:
+        timeframe: { type: string, enum: ["1m", "5m"] }
+        candleTime: { type: string, format: date-time }
+        close: { type: number }
+        rsi: { type: number }
+        ema9: { type: number }
+        ema21: { type: number }
+        volume: { type: number }
+        averageVolume: { type: number }
+        volumeRatio: { type: number }
+        trend: { type: string, enum: ["bullish", "bearish", "neutral"] }
+      required: [timeframe, candleTime, close, rsi, ema9, ema21, volume, averageVolume, volumeRatio, trend]
+    Signal:
+      type: object
+      properties:
+        id: { type: integer }
+        timestamp: { type: string, format: date-time }
+        direction: { type: string, enum: ["BUY", "SELL", "HOLD"] }
+        timeframe: { type: string, enum: ["1m", "5m"] }
+        price: { type: number }
+        confidence: { type: number }
+        reason: { type: string }
+      required: [id, timestamp, direction, timeframe, price, confidence, reason]
+    Trade:
+      type: object
+      properties:
+        id: { type: integer }
+        openedAt: { type: string, format: date-time }
+        closedAt: { type: ["string", "null"], format: date-time }
+        side: { type: string, enum: ["LONG"] }
+        status: { type: string, enum: ["OPEN", "CLOSED"] }
+        entryPrice: { type: number }
+        exitPrice: { type: ["number", "null"] }
+        quantity: { type: number }
+        feesUsdc: { type: number }
+        slippageUsdc: { type: number }
+        realizedPnlUsdc: { type: ["number", "null"] }
+        exitReason: { type: ["string", "null"] }
+      required: [id, openedAt, closedAt, side, status, entryPrice, exitPrice, quantity, feesUsdc, slippageUsdc, realizedPnlUsdc, exitReason]
+    OpenPosition:
+      type: object
+      properties:
+        quantity: { type: number }
+        entryPrice: { type: number }
+        stopLossPrice: { type: number }
+        takeProfitPrice: { type: number }
+        openedAt: { type: string, format: date-time }
+        unrealizedPnlUsdc: { type: number }
+      required: [quantity, entryPrice, stopLossPrice, takeProfitPrice, openedAt, unrealizedPnlUsdc]
+    BotSettings:
+      type: object
+      properties:
+        startingBalanceUsdc: { type: number }
+        positionSizePercent: { type: number }
+        stopLossPercent: { type: number }
+        takeProfitPercent: { type: number }
+        maxDailyLossUsdc: { type: number }
+        feePercent: { type: number }
+        slippagePercent: { type: number }
+      required: [startingBalanceUsdc, positionSizePercent, stopLossPercent, takeProfitPercent, maxDailyLossUsdc, feePercent, slippagePercent]
+    BotSettingsInput:
+      type: object
+      properties:
+        startingBalanceUsdc: { type: number, minimum: 100, maximum: 10000000 }
+        positionSizePercent: { type: number, minimum: 1, maximum: 100 }
+        stopLossPercent: { type: number, minimum: 0.1, maximum: 20 }
+        takeProfitPercent: { type: number, minimum: 0.1, maximum: 50 }
+        maxDailyLossUsdc: { type: number, minimum: 1, maximum: 10000000 }
+        feePercent: { type: number, minimum: 0, maximum: 5 }
+        slippagePercent: { type: number, minimum: 0, maximum: 5 }
+      required: [startingBalanceUsdc, positionSizePercent, stopLossPercent, takeProfitPercent, maxDailyLossUsdc, feePercent, slippagePercent]
+    BotControlInput:
+      type: object
+      properties:
+        running: { type: boolean }
+      required: [running]
+    BotStatus:
+      type: object
+      properties:
+        running: { type: boolean }
+        mode: { type: string, enum: ["PAPER"] }
+        dailyLossLimitReached: { type: boolean }
+        dailyPnlUsdc: { type: number }
+        cashUsdc: { type: number }
+        equityUsdc: { type: number }
+        realizedPnlUsdc: { type: number }
+        unrealizedPnlUsdc: { type: number }
+        openPosition:
+          anyOf:
+            - $ref: "#/components/schemas/OpenPosition"
+            - type: "null"
+      required: [running, mode, dailyLossLimitReached, dailyPnlUsdc, cashUsdc, equityUsdc, realizedPnlUsdc, unrealizedPnlUsdc, openPosition]
+    BotDashboard:
+      type: object
+      properties:
+        market:
+          type: object
+          properties:
+            symbol: { type: string, enum: ["SOL/USDC"] }
+            price: { type: number }
+            source: { type: string }
+            updatedAt: { type: string, format: date-time }
+            stale: { type: boolean }
+            candles1m:
+              type: array
+              items: { $ref: "#/components/schemas/Candle" }
+          required: [symbol, price, source, updatedAt, stale, candles1m]
+        indicators:
+          type: array
+          items: { $ref: "#/components/schemas/IndicatorSnapshot" }
+        signal: { $ref: "#/components/schemas/Signal" }
+        status: { $ref: "#/components/schemas/BotStatus" }
+        settings: { $ref: "#/components/schemas/BotSettings" }
+        todayTradeCount: { type: integer }
+        winRatePercent: { type: number }
+      required: [market, indicators, signal, status, settings, todayTradeCount, winRatePercent]

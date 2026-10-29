@@ -1,0 +1,1 @@
+- [SOL public market data](market-data-provider.md) — Kraken is reachable here; its final OHLC item is unfinished, and Binance/Coinbase endpoints were unavailable.

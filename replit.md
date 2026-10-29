@@ -1,44 +1,53 @@
-# [Project name]
+# SOL Scalper
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Paper-only SOL/USDC scalping dashboard with public market data, 1-minute and 5-minute indicators, configurable risk controls, and simulated trades. It never connects a wallet or submits exchange orders.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/sol-scalper run dev` — run the SOL Scalper dashboard
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `pnpm --filter @workspace/sol-scalper run typecheck` — check the dashboard
+- `python3 artifacts/api-server/src/python/sol_engine.py dashboard` — run the paper engine directly
+- Kraken's public SOL/USDC endpoints need no exchange credentials or API key.
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5
-- DB: PostgreSQL + Drizzle ORM
+- Shared database support: PostgreSQL + Drizzle ORM; paper-trading history: Python stdlib SQLite
 - Validation: Zod (`zod/v4`), `drizzle-zod`
 - API codegen: Orval (from OpenAPI spec)
 - Build: esbuild (CJS bundle)
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `lib/api-spec/openapi.yaml` — source of truth for the SOL Scalper API contract
+- `artifacts/api-server/src/python/sol_engine.py` — market data, indicators, signals, risk checks, and paper simulation
+- `artifacts/api-server/src/routes/sol-scalper.ts` — Express bridge into the Python engine
+- `artifacts/sol-scalper/src/` — React dashboard and interface
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- The engine starts in PAPER mode and has no wallet, credential, or live-order path.
+- Public Kraken market data is used; the engine fails visibly if the feed is unavailable instead of fabricating fallback prices.
+- The Python engine owns trading calculations and SQLite paper history; Express validates the API contract and invokes it.
+- Only closed candles create signals. Stop-loss, take-profit, fees, slippage, position sizing, and the daily-loss lock apply to simulated positions.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Users can monitor SOL/USDC, review 1m/5m RSI, EMA9/EMA21 and volume, inspect BUY/SELL/HOLD signals, adjust paper risk settings, pause or resume the simulator, and review recorded signals and simulated trades.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+Keep the product paper-only. Never add wallet connection, private-key handling, or real order execution without a new explicit request.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Kraken's OHLC API takes numeric interval values (`1` and `5`) and always includes an unfinished final candle; exclude it from signal calculations.
+- Paper history is stored in a local SQLite file under `artifacts/api-server/data/` (ignored by Git).
 
 ## Pointers
 

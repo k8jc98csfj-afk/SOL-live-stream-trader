@@ -53,3 +53,8 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Local paper-trading history
+artifacts/api-server/data/*.sqlite3
+artifacts/api-server/data/*.sqlite3-shm
+artifacts/api-server/data/*.sqlite3-wal

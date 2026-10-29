@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/sol-scalper/"
+title = "SOL Scalper"
+description = "A paper-only SOL/USDC scalping dashboard with live public prices, candle indicators, configurable risk controls, and a Python simulation engine. No wallet connection or live trading."
+version = "1.0.0"
+id = "artifacts/sol-scalper"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/sol-scalper/" ]
+localPort = 24093
+
+[services.development]
+run = "pnpm --filter @workspace/sol-scalper run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/sol-scalper", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/sol-scalper/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24093"
+BASE_PATH = "/sol-scalper/"
