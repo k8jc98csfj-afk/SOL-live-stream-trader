@@ -529,6 +529,8 @@ h1 { margin:8px 0 0;font:700 25px var(--app-font-serif);letter-spacing:-.045em;c
 .position-box { margin-top:12px;padding:12px;background:#f3f4ef;border-radius:6px; }
 .position-head { display:flex;justify-content:space-between;color:#677571;font-size:10px; }
 .position-nums { display:flex;justify-content:space-between;margin-top:10px;font:10px var(--app-font-mono);color:#536563; }
+.position-nums.fill-detail,.quantity-detail { color:#899590;font-size:9px; }
+.quantity-detail { display:block;margin-top:4px; }
 .settings { padding:16px 17px; }
 .settings-intro { margin:0 0 15px;color:#88928f;font-size:10px;line-height:1.5; }
 .field-grid { display:grid;grid-template-columns:1fr 1fr;gap:11px 10px; }

@@ -80,6 +80,99 @@ def finite_number(value: Any, name: str) -> float:
     return number
 
 
+def simulate_book_fill(
+    levels: list[dict[str, float]],
+    requested_quantity: float,
+    side: str,
+    slippage_percent: float,
+    reference_price: float,
+    fee_percent: float = 0.0,
+    max_quote_usdc: float | None = None,
+    minimum_fill_price: float | None = None,
+) -> dict[str, Any]:
+    """Walk a snapshot of book levels and return its filled and remaining size."""
+    if side not in {"buy", "sell"}:
+        raise InvalidRequest("Fill side must be 'buy' or 'sell'.")
+    requested_quantity = finite_number(requested_quantity, "requested quantity")
+    reference_price = finite_number(reference_price, "reference price")
+    slippage_rate = finite_number(slippage_percent, "slippage percent") / 100.0
+    fee_rate = finite_number(fee_percent, "fee percent") / 100.0
+    if requested_quantity < 0 or reference_price <= 0:
+        raise InvalidRequest("Fill quantity must be non-negative and price positive.")
+    if slippage_rate < 0 or slippage_rate >= 1 or fee_rate < 0:
+        raise InvalidRequest("Fill fees and slippage must be non-negative.")
+    if not levels or requested_quantity == 0:
+        return {
+            "requestedQuantity": requested_quantity,
+            "filledQuantity": 0.0,
+            "remainingQuantity": requested_quantity,
+            "averagePrice": 0.0,
+            "notionalUsdc": 0.0,
+            "feeUsdc": 0.0,
+            "slippageUsdc": 0.0,
+            "levelFills": [],
+        }
+
+    ordered_levels = sorted(
+        levels,
+        key=lambda level: float(level["price"]),
+        reverse=side == "sell",
+    )
+    best_price = float(ordered_levels[0]["price"])
+    if best_price <= 0:
+        raise MarketDataUnavailable("Kraken returned an invalid SOL/USDC book price.")
+    price_scale = reference_price / best_price
+    remaining = requested_quantity
+    filled = 0.0
+    notional = 0.0
+    raw_notional = 0.0
+    level_fills: list[dict[str, float]] = []
+    for level in ordered_levels:
+        level_price = finite_number(level.get("price"), "order-book price")
+        level_quantity = finite_number(level.get("quantity"), "order-book quantity")
+        if level_price <= 0 or level_quantity <= 0:
+            raise MarketDataUnavailable(
+                "Kraken returned an invalid SOL/USDC order-book level."
+            )
+        market_price = level_price * price_scale
+        execution_price = market_price * (
+            1.0 + slippage_rate if side == "buy" else 1.0 - slippage_rate
+        )
+        if minimum_fill_price is not None and execution_price < minimum_fill_price:
+            continue
+
+        level_fill = min(remaining, level_quantity)
+        if max_quote_usdc is not None:
+            quote_left = max_quote_usdc - notional * (1.0 + fee_rate)
+            if quote_left <= 0:
+                break
+            level_fill = min(
+                level_fill, quote_left / (execution_price * (1.0 + fee_rate))
+            )
+        if level_fill <= 0:
+            continue
+        filled += level_fill
+        remaining -= level_fill
+        notional += level_fill * execution_price
+        raw_notional += level_fill * market_price
+        level_fills.append({"price": level_price, "quantity": level_fill})
+        if remaining <= max(requested_quantity, 1.0) * 1e-12:
+            remaining = 0.0
+            break
+
+    fee = notional * fee_rate
+    return {
+        "requestedQuantity": requested_quantity,
+        "filledQuantity": filled,
+        "remainingQuantity": max(0.0, remaining),
+        "averagePrice": notional / filled if filled > 0 else 0.0,
+        "notionalUsdc": notional,
+        "feeUsdc": fee,
+        "slippageUsdc": abs(notional - raw_notional),
+        "levelFills": level_fills,
+    }
+
+
 class KrakenPublicMarketData:
     """Read-only public REST client; it never sends authenticated requests."""
 
@@ -133,6 +226,38 @@ class KrakenPublicMarketData:
             raise MarketDataUnavailable("Kraken returned an invalid SOL/USDC spread.")
         return quote
 
+    def _order_book(self) -> dict[str, list[dict[str, float]]]:
+        result = self._get_json(
+            "Depth", {"pair": SYMBOL, "count": "25"}
+        ).get("result", {})
+        book = result.get(SYMBOL) or next(
+            (value for key, value in result.items() if key != "last"), {}
+        )
+        parsed: dict[str, list[dict[str, float]]] = {}
+        for side in ("bids", "asks"):
+            levels = book.get(side, [])
+            parsed_levels = []
+            for level in levels:
+                if len(level) < 2:
+                    continue
+                price = finite_number(level[0], "order-book price")
+                quantity = finite_number(level[1], "order-book quantity")
+                if price <= 0 or quantity <= 0:
+                    raise MarketDataUnavailable(
+                        "Kraken returned an invalid SOL/USDC order-book level."
+                    )
+                parsed_levels.append({"price": price, "quantity": quantity})
+            parsed[side] = sorted(
+                parsed_levels,
+                key=lambda level: level["price"],
+                reverse=side == "bids",
+            )
+        if not parsed["bids"] or not parsed["asks"]:
+            raise MarketDataUnavailable(
+                "Kraken did not return usable SOL/USDC order-book depth."
+            )
+        return parsed
+
     def _candles(self, interval: str) -> list[dict[str, Any]]:
         result = self._get_json(
             "OHLC", {"pair": SYMBOL, "interval": interval}
@@ -167,13 +292,15 @@ class KrakenPublicMarketData:
         return candles
 
     def get_snapshot(self) -> dict[str, Any]:
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             ticker_job = executor.submit(self._ticker)
+            order_book_job = executor.submit(self._order_book)
             one_minute_job = executor.submit(self._candles, "1")
             five_minute_job = executor.submit(self._candles, "5")
             ticker = ticker_job.result()
             return {
                 **ticker,
+                "orderBook": order_book_job.result(),
                 "candles1m": one_minute_job.result(),
                 "candles5m": five_minute_job.result(),
                 "updatedAt": iso_utc(),
@@ -374,7 +501,13 @@ class PaperTradingEngine:
                     slippage_percent REAL NOT NULL,
                     stop_loss_price REAL NOT NULL,
                     take_profit_price REAL NOT NULL,
-                    entry_candle_open_ms INTEGER
+                    entry_candle_open_ms INTEGER,
+                    requested_quantity REAL NOT NULL DEFAULT 0,
+                    unfilled_quantity REAL NOT NULL DEFAULT 0,
+                    remaining_quantity REAL NOT NULL DEFAULT 0,
+                    exit_filled_quantity REAL NOT NULL DEFAULT 0,
+                    entry_fees_usdc REAL NOT NULL DEFAULT 0,
+                    partial_realized_pnl_usdc REAL NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -386,6 +519,36 @@ class PaperTradingEngine:
                 connection.execute(
                     "ALTER TABLE trades ADD COLUMN entry_candle_open_ms INTEGER"
                 )
+            trade_migrations = {
+                "requested_quantity": "REAL NOT NULL DEFAULT 0",
+                "unfilled_quantity": "REAL NOT NULL DEFAULT 0",
+                "remaining_quantity": "REAL NOT NULL DEFAULT 0",
+                "exit_filled_quantity": "REAL NOT NULL DEFAULT 0",
+                "entry_fees_usdc": "REAL NOT NULL DEFAULT 0",
+                "partial_realized_pnl_usdc": "REAL NOT NULL DEFAULT 0",
+            }
+            for column, definition in trade_migrations.items():
+                if column not in trade_columns:
+                    connection.execute(
+                        f"ALTER TABLE trades ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE trades
+                SET requested_quantity = quantity,
+                    remaining_quantity = CASE
+                      WHEN status = 'OPEN' THEN quantity ELSE 0
+                    END
+                WHERE requested_quantity = 0
+                """
+            )
+            connection.execute(
+                """
+                UPDATE trades
+                SET entry_fees_usdc = fees_usdc
+                WHERE status = 'OPEN' AND entry_fees_usdc = 0
+                """
+            )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_one_open_position
@@ -486,12 +649,18 @@ class PaperTradingEngine:
     ) -> tuple[float, float, float]:
         if not trade:
             return 0.0, 0.0, 0.0
-        quantity = float(trade["quantity"])
+        quantity = float(trade["remaining_quantity"])
         slippage_rate = float(trade["slippage_percent"]) / 100.0
         fee_rate = float(trade["fee_percent"]) / 100.0
         exit_price = price * (1.0 - slippage_rate)
         exit_fee = quantity * exit_price * fee_rate
-        entry_cost = quantity * float(trade["entry_price"]) + float(trade["fees_usdc"])
+        entry_filled = float(trade["quantity"])
+        entry_fee = (
+            float(trade["entry_fees_usdc"]) * quantity / entry_filled
+            if entry_filled > 0
+            else 0.0
+        )
+        entry_cost = quantity * float(trade["entry_price"]) + entry_fee
         net_pnl = quantity * exit_price - exit_fee - entry_cost
         return net_pnl, exit_price, exit_fee
 
@@ -503,7 +672,7 @@ class PaperTradingEngine:
         unrealized, exit_price, exit_fee = self._position_pnl(trade, price)
         equity = float(account["cash_usdc"])
         if trade:
-            equity += float(trade["quantity"]) * exit_price - exit_fee
+            equity += float(trade["remaining_quantity"]) * exit_price - exit_fee
         return equity, unrealized, trade
 
     def _reset_day_if_needed(self, connection: sqlite3.Connection, price: float) -> None:
@@ -594,41 +763,96 @@ class PaperTradingEngine:
         trade: sqlite3.Row,
         market_price: float,
         reason: str,
+        snapshot: dict[str, Any],
         apply_slippage: bool = True,
     ) -> None:
-        quantity = float(trade["quantity"])
-        slippage_rate = float(trade["slippage_percent"]) / 100.0
-        fee_rate = float(trade["fee_percent"]) / 100.0
-        exit_price = (
-            market_price * (1.0 - slippage_rate)
-            if apply_slippage
-            else market_price
+        quantity = float(trade["remaining_quantity"])
+        bids = (snapshot.get("orderBook") or {}).get("bids", [])
+        if not bids:
+            raise MarketDataUnavailable(
+                "Kraken did not return usable SOL/USDC bid depth for this paper exit."
+            )
+        fill = simulate_book_fill(
+            bids,
+            quantity,
+            "sell",
+            float(trade["slippage_percent"]) if apply_slippage else 0.0,
+            market_price,
+            fee_percent=float(trade["fee_percent"]),
+            minimum_fill_price=(
+                float(trade["take_profit_price"])
+                if reason == "Take-profit"
+                else None
+            ),
         )
-        exit_notional = quantity * exit_price
-        exit_fee = exit_notional * fee_rate
-        entry_price = float(trade["entry_price"])
-        entry_fee = float(trade["fees_usdc"])
-        entry_market_estimate = entry_price / (1.0 + slippage_rate)
-        entry_slippage = quantity * max(0.0, entry_price - entry_market_estimate)
-        exit_slippage = (
-            quantity * max(0.0, market_price - exit_price)
-            if apply_slippage
+        exited_quantity = float(fill["filledQuantity"])
+        if exited_quantity <= 0:
+            return
+        for consumed in fill["levelFills"]:
+            for level in bids:
+                if float(level["price"]) == consumed["price"]:
+                    level["quantity"] = max(
+                        0.0,
+                        float(level["quantity"]) - consumed["quantity"],
+                    )
+                    break
+        snapshot["orderBook"]["bids"] = [
+            level for level in bids if float(level["quantity"]) > 1e-12
+        ]
+
+        entry_filled_quantity = float(trade["quantity"])
+        entry_fee_allocated = (
+            float(trade["entry_fees_usdc"])
+            * exited_quantity
+            / entry_filled_quantity
+            if entry_filled_quantity > 0
             else 0.0
         )
-        net_pnl = exit_notional - exit_fee - quantity * entry_price - entry_fee
+        exit_notional = float(fill["notionalUsdc"])
+        exit_fee = float(fill["feeUsdc"])
+        exit_slippage = float(fill["slippageUsdc"])
+        exit_filled_quantity = (
+            float(trade["exit_filled_quantity"]) + exited_quantity
+        )
+        previous_exit_notional = (
+            float(trade["exit_price"] or 0.0)
+            * float(trade["exit_filled_quantity"])
+        )
+        aggregate_exit_price = (
+            previous_exit_notional + exit_notional
+        ) / exit_filled_quantity
+        remaining_quantity = max(0.0, quantity - exited_quantity)
+        if remaining_quantity <= max(entry_filled_quantity, 1.0) * 1e-12:
+            remaining_quantity = 0.0
+        previous_partial_pnl = float(trade["partial_realized_pnl_usdc"])
+        partial_pnl = (
+            previous_partial_pnl
+            + exit_notional
+            - exit_fee
+            - exited_quantity * float(trade["entry_price"])
+            - entry_fee_allocated
+        )
+        fully_closed = remaining_quantity == 0.0
         connection.execute(
             """
-            UPDATE trades SET closed_at = ?, exit_price = ?, fees_usdc = ?,
-              slippage_usdc = ?, realized_pnl_usdc = ?, exit_reason = ?, status = 'CLOSED'
+            UPDATE trades SET closed_at = ?, exit_price = ?,
+              remaining_quantity = ?, exit_filled_quantity = ?,
+              fees_usdc = fees_usdc + ?, slippage_usdc = slippage_usdc + ?,
+              realized_pnl_usdc = ?, partial_realized_pnl_usdc = ?,
+              exit_reason = ?, status = ?
             WHERE id = ?
             """,
             (
-                iso_utc(),
-                exit_price,
-                entry_fee + exit_fee,
-                entry_slippage + exit_slippage,
-                net_pnl,
-                reason,
+                iso_utc() if fully_closed else None,
+                aggregate_exit_price,
+                remaining_quantity,
+                exit_filled_quantity,
+                exit_fee,
+                exit_slippage,
+                partial_pnl if fully_closed else None,
+                partial_pnl,
+                reason if fully_closed else None,
+                "CLOSED" if fully_closed else "OPEN",
                 int(trade["id"]),
             ),
         )
@@ -637,7 +861,7 @@ class PaperTradingEngine:
             UPDATE account SET cash_usdc = cash_usdc + ?,
               realized_pnl_usdc = realized_pnl_usdc + ? WHERE id = 1
             """,
-            (exit_notional - exit_fee, net_pnl),
+            (exit_notional - exit_fee, partial_pnl - previous_partial_pnl),
         )
 
     def _open_position(
@@ -646,6 +870,7 @@ class PaperTradingEngine:
         settings: dict[str, float],
         price: float,
         entry_candle_open_ms: int,
+        order_book: dict[str, Any],
     ) -> bool:
         account = connection.execute("SELECT * FROM account WHERE id = 1").fetchone()
         equity, _, current_trade = self._equity(connection, price)
@@ -660,15 +885,37 @@ class PaperTradingEngine:
             equity * settings["positionSizePercent"] / 100.0,
             float(account["cash_usdc"]),
         )
-        slippage_rate = settings["slippagePercent"] / 100.0
-        fee_rate = settings["feePercent"] / 100.0
-        entry_price = price * (1.0 + slippage_rate)
-        quantity = budget / (entry_price * (1.0 + fee_rate)) if entry_price > 0 else 0.0
+        asks = order_book.get("asks", [])
+        if not asks:
+            raise MarketDataUnavailable(
+                "Kraken did not return usable SOL/USDC ask depth for this paper entry."
+            )
+        requested_quantity = (
+            budget
+            / (
+                price
+                * (1.0 + settings["slippagePercent"] / 100.0)
+                * (1.0 + settings["feePercent"] / 100.0)
+            )
+            if price > 0
+            else 0.0
+        )
+        fill = simulate_book_fill(
+            asks,
+            requested_quantity,
+            "buy",
+            settings["slippagePercent"],
+            price,
+            fee_percent=settings["feePercent"],
+            max_quote_usdc=budget,
+        )
+        quantity = float(fill["filledQuantity"])
         if quantity <= 0:
             return False
-        entry_notional = quantity * entry_price
-        entry_fee = entry_notional * fee_rate
-        slippage_cost = quantity * (entry_price - price)
+        entry_price = float(fill["averagePrice"])
+        entry_notional = float(fill["notionalUsdc"])
+        entry_fee = float(fill["feeUsdc"])
+        slippage_cost = float(fill["slippageUsdc"])
         stop_price = entry_price * (1.0 - settings["stopLossPercent"] / 100.0)
         target_price = entry_price * (1.0 + settings["takeProfitPercent"] / 100.0)
         connection.execute(
@@ -676,8 +923,10 @@ class PaperTradingEngine:
             INSERT INTO trades (
                 opened_at, entry_price, quantity, fees_usdc, slippage_usdc,
                 status, fee_percent, slippage_percent, stop_loss_price,
-                take_profit_price, entry_candle_open_ms
-            ) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+                take_profit_price, entry_candle_open_ms, requested_quantity,
+                unfilled_quantity, remaining_quantity, exit_filled_quantity,
+                entry_fees_usdc, partial_realized_pnl_usdc
+            ) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
             ON CONFLICT DO NOTHING
             """,
             (
@@ -691,6 +940,10 @@ class PaperTradingEngine:
                 stop_price,
                 target_price,
                 entry_candle_open_ms,
+                requested_quantity,
+                float(fill["remainingQuantity"]),
+                quantity,
+                entry_fee,
             ),
         )
         if connection.execute("SELECT changes() AS count").fetchone()["count"] == 0:
@@ -709,7 +962,10 @@ class PaperTradingEngine:
         position = None
         if trade:
             position = {
-                "quantity": float(trade["quantity"]),
+                "quantity": float(trade["remaining_quantity"]),
+                "requestedQuantity": float(trade["requested_quantity"]),
+                "entryFilledQuantity": float(trade["quantity"]),
+                "unfilledEntryQuantity": float(trade["unfilled_quantity"]),
                 "entryPrice": float(trade["entry_price"]),
                 "stopLossPrice": float(trade["stop_loss_price"]),
                 "takeProfitPrice": float(trade["take_profit_price"]),
@@ -751,6 +1007,11 @@ class PaperTradingEngine:
             "entryPrice": float(row["entry_price"]),
             "exitPrice": float(row["exit_price"]) if row["exit_price"] is not None else None,
             "quantity": float(row["quantity"]),
+            "requestedQuantity": float(row["requested_quantity"]),
+            "unfilledEntryQuantity": float(row["unfilled_quantity"]),
+            "remainingQuantity": float(row["remaining_quantity"]),
+            "exitFilledQuantity": float(row["exit_filled_quantity"]),
+            "partialRealizedPnlUsdc": float(row["partial_realized_pnl_usdc"]),
             "feesUsdc": float(row["fees_usdc"]),
             "slippageUsdc": float(row["slippage_usdc"]),
             "realizedPnlUsdc": (
@@ -867,6 +1128,7 @@ class PaperTradingEngine:
                         trade,
                         exit_market_price,
                         exit_reason,
+                        snapshot,
                         apply_slippage,
                     )
 
@@ -878,7 +1140,11 @@ class PaperTradingEngine:
                 trade = self._open_trade(connection)
                 if trade:
                     self._close_trade(
-                        connection, trade, mark_price, "Maximum daily loss"
+                        connection,
+                        trade,
+                        mark_price,
+                        "Maximum daily loss",
+                        snapshot,
                     )
                 connection.execute(
                     """
@@ -897,6 +1163,7 @@ class PaperTradingEngine:
                     settings,
                     float(snapshot.get("ask", snapshot["price"])),
                     int(last_candle["open_time"]),
+                    snapshot.get("orderBook") or {},
                 )
                 if opened:
                     post_entry_status = self._status(connection, mark_price)
@@ -911,6 +1178,7 @@ class PaperTradingEngine:
                                 trade,
                                 mark_price,
                                 "Maximum daily loss",
+                                snapshot,
                             )
                         connection.execute(
                             """

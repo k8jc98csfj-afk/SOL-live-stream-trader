@@ -105,6 +105,11 @@ export interface Trade {
   /** @nullable */
   exitPrice: number | null;
   quantity: number;
+  requestedQuantity: number;
+  unfilledEntryQuantity: number;
+  remainingQuantity: number;
+  exitFilledQuantity: number;
+  partialRealizedPnlUsdc: number;
   feesUsdc: number;
   slippageUsdc: number;
   /** @nullable */
@@ -115,6 +120,9 @@ export interface Trade {
 
 export interface OpenPosition {
   quantity: number;
+  requestedQuantity: number;
+  entryFilledQuantity: number;
+  unfilledEntryQuantity: number;
   entryPrice: number;
   stopLossPrice: number;
   takeProfitPrice: number;

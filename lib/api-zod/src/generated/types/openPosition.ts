@@ -8,6 +8,9 @@
 
 export interface OpenPosition {
   quantity: number;
+  requestedQuantity: number;
+  entryFilledQuantity: number;
+  unfilledEntryQuantity: number;
   entryPrice: number;
   stopLossPrice: number;
   takeProfitPrice: number;

@@ -13,6 +13,7 @@ from sol_engine import (
     PaperTradingEngine,
     build_signal,
     iso_utc,
+    simulate_book_fill,
     to_candle_time,
 )
 
@@ -65,6 +66,10 @@ def make_snapshot(price: float = 100.0) -> dict:
         "price": price,
         "bid": price - 0.01,
         "ask": price + 0.01,
+        "orderBook": {
+            "bids": [{"price": price - 0.01, "quantity": 1_000_000.0}],
+            "asks": [{"price": price + 0.01, "quantity": 1_000_000.0}],
+        },
         "candles1m": candles_1m,
         "candles5m": candles_5m,
         "updatedAt": iso_utc(),
@@ -149,6 +154,88 @@ class SolEngineTests(unittest.TestCase):
                 market._ticker(),
                 {"price": 100.1, "bid": 100.0, "ask": 100.2},
             )
+
+    def test_public_order_book_parses_and_sorts_levels(self) -> None:
+        market = KrakenPublicMarketData()
+        response = {
+            "error": [],
+            "result": {
+                "SOLUSDC": {
+                    "bids": [["99.8", "4", 1], ["99.9", "2", 1]],
+                    "asks": [["100.2", "3", 1], ["100.1", "1", 1]],
+                }
+            },
+        }
+        with patch.object(market, "_get_json", return_value=response):
+            self.assertEqual(
+                market._order_book(),
+                {
+                    "bids": [
+                        {"price": 99.9, "quantity": 2.0},
+                        {"price": 99.8, "quantity": 4.0},
+                    ],
+                    "asks": [
+                        {"price": 100.1, "quantity": 1.0},
+                        {"price": 100.2, "quantity": 3.0},
+                    ],
+                },
+            )
+
+    def test_book_fill_walks_levels_and_reports_partial_quantity(self) -> None:
+        fill = simulate_book_fill(
+            [
+                {"price": 100.0, "quantity": 0.25},
+                {"price": 101.0, "quantity": 0.25},
+            ],
+            1.0,
+            "buy",
+            0.0,
+            100.0,
+        )
+        self.assertAlmostEqual(fill["filledQuantity"], 0.5)
+        self.assertAlmostEqual(fill["remainingQuantity"], 0.5)
+        self.assertAlmostEqual(fill["averagePrice"], 100.5)
+
+    def test_entry_reflects_thin_ask_depth_and_tracks_unfilled_size(self) -> None:
+        settings = self.engine.get_settings()
+        settings["positionSizePercent"] = 1.0
+        self.engine.update_settings(settings)
+        snapshot = make_snapshot()
+        snapshot["orderBook"]["asks"] = [
+            {"price": 100.01, "quantity": 0.01},
+            {"price": 100.11, "quantity": 0.02},
+        ]
+        self.market.snapshot = snapshot
+
+        trade = self.seed_open_trade()
+
+        self.assertAlmostEqual(trade["quantity"], 0.03)
+        self.assertGreater(trade["requested_quantity"], trade["quantity"])
+        self.assertAlmostEqual(
+            trade["unfilled_quantity"],
+            trade["requested_quantity"] - trade["quantity"],
+        )
+        listed = self.engine.list_trades()[0]
+        self.assertAlmostEqual(listed["remainingQuantity"], trade["quantity"])
+        self.assertGreater(listed["unfilledEntryQuantity"], 0)
+
+    def test_entry_price_walks_multiple_ask_levels(self) -> None:
+        settings = self.engine.get_settings()
+        settings["positionSizePercent"] = 1.0
+        self.engine.update_settings(settings)
+        snapshot = make_snapshot()
+        snapshot["orderBook"]["asks"] = [
+            {"price": 100.01, "quantity": 0.25},
+            {"price": 100.11, "quantity": 0.25},
+            {"price": 100.21, "quantity": 100.0},
+        ]
+        self.market.snapshot = snapshot
+
+        trade = self.seed_open_trade()
+
+        self.assertGreater(trade["entry_price"], 100.01 * 1.0005)
+        self.assertGreater(trade["unfilled_quantity"], 0.0)
+        self.assertLess(trade["unfilled_quantity"], trade["requested_quantity"])
 
     def test_new_account_and_startup_are_off(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as connection, connection:
@@ -243,7 +330,13 @@ class SolEngineTests(unittest.TestCase):
                 - entry_fee
             )
             self.assertAlmostEqual(unrealized, expected_open, places=8)
-            self.engine._close_trade(connection, row, mark_price, "test close")
+            self.engine._close_trade(
+                connection,
+                row,
+                mark_price,
+                "test close",
+                self.market.snapshot,
+            )
 
         closed = self.engine.list_trades()[0]
         self.assertEqual(closed["status"], "CLOSED")
@@ -348,6 +441,42 @@ class SolEngineTests(unittest.TestCase):
         self.assertEqual(closed["exitReason"], "Take-profit")
         self.assertAlmostEqual(closed["exitPrice"], target, places=8)
         self.assertAlmostEqual(closed["slippageUsdc"], trade["slippage_usdc"], places=8)
+
+    def test_partial_exit_tracks_remaining_quantity_and_retries_on_next_snapshot(self) -> None:
+        trade = self.seed_open_trade()
+        target = float(trade["take_profit_price"])
+        snapshot = make_snapshot(target + 0.2)
+        snapshot["orderBook"]["bids"] = [
+            {"price": target, "quantity": 0.1},
+        ]
+        self.market.snapshot = snapshot
+        with patch("sol_engine.build_signal", return_value=HOLD):
+            self.engine.evaluate()
+
+        partial = self.engine.list_trades()[0]
+        self.assertEqual(partial["status"], "OPEN")
+        self.assertAlmostEqual(partial["exitFilledQuantity"], 0.1)
+        self.assertAlmostEqual(
+            partial["remainingQuantity"], trade["quantity"] - 0.1
+        )
+        self.assertGreater(partial["partialRealizedPnlUsdc"], 0)
+
+        snapshot["orderBook"]["bids"] = [
+            {"price": target, "quantity": trade["quantity"]},
+        ]
+        with patch("sol_engine.build_signal", return_value=HOLD):
+            self.engine.evaluate()
+        closed = self.engine.list_trades()[0]
+        self.assertEqual(closed["status"], "CLOSED")
+        self.assertAlmostEqual(closed["remainingQuantity"], 0.0)
+        self.assertAlmostEqual(closed["exitFilledQuantity"], trade["quantity"])
+        self.assertAlmostEqual(
+            closed["realizedPnlUsdc"],
+            closed["quantity"] * closed["exitPrice"]
+            - closed["feesUsdc"]
+            - closed["quantity"] * closed["entryPrice"],
+            places=7,
+        )
 
     def test_take_profit_gap_gets_open_price_improvement(self) -> None:
         trade = self.seed_open_trade()

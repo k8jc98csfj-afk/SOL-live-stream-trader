@@ -193,21 +193,29 @@ components:
         entryPrice: { type: number }
         exitPrice: { type: ["number", "null"] }
         quantity: { type: number }
+        requestedQuantity: { type: number }
+        unfilledEntryQuantity: { type: number }
+        remainingQuantity: { type: number }
+        exitFilledQuantity: { type: number }
+        partialRealizedPnlUsdc: { type: number }
         feesUsdc: { type: number }
         slippageUsdc: { type: number }
         realizedPnlUsdc: { type: ["number", "null"] }
         exitReason: { type: ["string", "null"] }
-      required: [id, openedAt, closedAt, side, status, entryPrice, exitPrice, quantity, feesUsdc, slippageUsdc, realizedPnlUsdc, exitReason]
+      required: [id, openedAt, closedAt, side, status, entryPrice, exitPrice, quantity, requestedQuantity, unfilledEntryQuantity, remainingQuantity, exitFilledQuantity, partialRealizedPnlUsdc, feesUsdc, slippageUsdc, realizedPnlUsdc, exitReason]
     OpenPosition:
       type: object
       properties:
         quantity: { type: number }
+        requestedQuantity: { type: number }
+        entryFilledQuantity: { type: number }
+        unfilledEntryQuantity: { type: number }
         entryPrice: { type: number }
         stopLossPrice: { type: number }
         takeProfitPrice: { type: number }
         openedAt: { type: string, format: date-time }
         unrealizedPnlUsdc: { type: number }
-      required: [quantity, entryPrice, stopLossPrice, takeProfitPrice, openedAt, unrealizedPnlUsdc]
+      required: [quantity, requestedQuantity, entryFilledQuantity, unfilledEntryQuantity, entryPrice, stopLossPrice, takeProfitPrice, openedAt, unrealizedPnlUsdc]
     BotSettings:
       type: object
       properties:

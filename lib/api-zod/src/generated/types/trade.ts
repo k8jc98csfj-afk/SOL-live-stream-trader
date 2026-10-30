@@ -19,6 +19,11 @@ export interface Trade {
   /** @nullable */
   exitPrice: number | null;
   quantity: number;
+  requestedQuantity: number;
+  unfilledEntryQuantity: number;
+  remainingQuantity: number;
+  exitFilledQuantity: number;
+  partialRealizedPnlUsdc: number;
   feesUsdc: number;
   slippageUsdc: number;
   /** @nullable */
