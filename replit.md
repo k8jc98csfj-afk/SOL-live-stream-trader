@@ -10,7 +10,7 @@ Paper-only SOL/USDC scalping dashboard with public market data, 1-minute and 5-m
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/sol-scalper run typecheck` — check the dashboard
-- `python3 artifacts/api-server/src/python/sol_engine.py dashboard` — run the paper engine directly
+- `pnpm --filter @workspace/api-server run test:python` — run the paper-engine unit tests
 - Kraken's public SOL/USDC endpoints need no exchange credentials or API key.
 
 ## Stack
@@ -26,15 +26,18 @@ Paper-only SOL/USDC scalping dashboard with public market data, 1-minute and 5-m
 
 - `lib/api-spec/openapi.yaml` — source of truth for the SOL Scalper API contract
 - `artifacts/api-server/src/python/sol_engine.py` — market data, indicators, signals, risk checks, and paper simulation
+- `artifacts/api-server/src/lib/sol-scalper-worker.ts` — independent paper-evaluation loop; resets simulator OFF at startup
 - `artifacts/api-server/src/routes/sol-scalper.ts` — Express bridge into the Python engine
 - `artifacts/sol-scalper/src/` — React dashboard and interface
 
 ## Architecture decisions
 
-- The engine starts in PAPER mode and has no wallet, credential, or live-order path.
+- The engine starts OFF in PAPER mode after every API restart and has no wallet, credential, or live-order path.
 - Public Kraken market data is used; the engine fails visibly if the feed is unavailable instead of fabricating fallback prices.
-- The Python engine owns trading calculations and SQLite paper history; Express validates the API contract and invokes it.
-- Only closed candles create signals. Stop-loss, take-profit, fees, slippage, position sizing, and the daily-loss lock apply to simulated positions.
+- Dashboard GETs are read-only. A server-owned worker evaluates paper signals and positions independently.
+- SQLite constraints enforce one open paper position and at most one entry for a given signal candle.
+- Stop exits use adverse slippage and gap-aware fills; take-profit exits model a limit fill at target or candle-open price improvement.
+- Only closed candles create signals. Fees, slippage, position sizing, and the daily-loss lock apply to simulated positions.
 
 ## Product
 

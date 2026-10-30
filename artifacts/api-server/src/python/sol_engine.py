@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -266,21 +267,37 @@ def build_signal(
 class PaperTradingEngine:
     """SQLite-backed, long-only paper simulator; it has no live order adapter."""
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, read_only: bool = False):
         default_path = Path(__file__).resolve().parents[2] / "data" / "sol-scalper.sqlite3"
         self.db_path = db_path or Path(os.environ.get("SOL_SCALPER_DB_PATH", default_path))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not self.read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.market_data = KrakenPublicMarketData()
-        self._initialize()
+        if not self.read_only:
+            self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10)
+        if self.read_only:
+            uri = self.db_path.resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=10)
+        else:
+            connection = sqlite3.connect(self.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
 
+    @contextmanager
+    def _session(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
@@ -301,7 +318,7 @@ class PaperTradingEngine:
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     cash_usdc REAL NOT NULL,
                     realized_pnl_usdc REAL NOT NULL DEFAULT 0,
-                    running INTEGER NOT NULL DEFAULT 1,
+                    running INTEGER NOT NULL DEFAULT 0,
                     daily_loss_limit_reached INTEGER NOT NULL DEFAULT 0,
                     utc_day TEXT NOT NULL,
                     day_start_equity REAL NOT NULL
@@ -339,8 +356,30 @@ class PaperTradingEngine:
                     fee_percent REAL NOT NULL,
                     slippage_percent REAL NOT NULL,
                     stop_loss_price REAL NOT NULL,
-                    take_profit_price REAL NOT NULL
+                    take_profit_price REAL NOT NULL,
+                    entry_candle_open_ms INTEGER
                 )
+                """
+            )
+            trade_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(trades)").fetchall()
+            }
+            if "entry_candle_open_ms" not in trade_columns:
+                connection.execute(
+                    "ALTER TABLE trades ADD COLUMN entry_candle_open_ms INTEGER"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_one_open_position
+                ON trades(status) WHERE status = 'OPEN'
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_one_entry_per_candle
+                ON trades(entry_candle_open_ms)
+                WHERE entry_candle_open_ms IS NOT NULL
                 """
             )
             connection.execute(
@@ -376,7 +415,7 @@ class PaperTradingEngine:
                 INSERT OR IGNORE INTO account (
                     id, cash_usdc, realized_pnl_usdc, running,
                     daily_loss_limit_reached, utc_day, day_start_equity
-                ) VALUES (1, ?, 0, 1, 0, ?, ?)
+                ) VALUES (1, ?, 0, 0, 0, ?, ?)
                 """,
                 (starting_balance, utc_now().date().isoformat(), starting_balance),
             )
@@ -388,27 +427,37 @@ class PaperTradingEngine:
             for key, column in SETTINGS_COLUMNS.items()
         }
 
-    def _market_snapshot(self) -> dict[str, Any]:
-        with self._connect() as connection:
-            cached = connection.execute(
-                "SELECT fetched_at, snapshot_json FROM market_cache WHERE id = 1"
-            ).fetchone()
-            if cached and time.time() - float(cached["fetched_at"]) < 5:
-                return json.loads(cached["snapshot_json"])
-
-        snapshot = self.market_data.get_snapshot()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO market_cache (id, fetched_at, snapshot_json)
-                VALUES (1, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  fetched_at = excluded.fetched_at,
-                  snapshot_json = excluded.snapshot_json
-                """,
-                (time.time(), json.dumps(snapshot, separators=(",", ":"))),
+    def _read_market_snapshot(
+        self, connection: sqlite3.Connection | None = None
+    ) -> dict[str, Any]:
+        if connection is None:
+            with self._session() as reader:
+                return self._read_market_snapshot(reader)
+        cached = connection.execute(
+            "SELECT fetched_at, snapshot_json FROM market_cache WHERE id = 1"
+        ).fetchone()
+        if not cached:
+            raise MarketDataUnavailable(
+                "The paper market-data worker has not published its first snapshot yet."
             )
+        snapshot = json.loads(cached["snapshot_json"])
+        snapshot["stale"] = time.time() - float(cached["fetched_at"]) > 15
         return snapshot
+
+    @staticmethod
+    def _store_market_snapshot(
+        connection: sqlite3.Connection, snapshot: dict[str, Any]
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO market_cache (id, fetched_at, snapshot_json)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              fetched_at = excluded.fetched_at,
+              snapshot_json = excluded.snapshot_json
+            """,
+            (time.time(), json.dumps(snapshot, separators=(",", ":"))),
+        )
 
     def _open_trade(self, connection: sqlite3.Connection) -> sqlite3.Row | None:
         return connection.execute(
@@ -425,9 +474,7 @@ class PaperTradingEngine:
         fee_rate = float(trade["fee_percent"]) / 100.0
         exit_price = price * (1.0 - slippage_rate)
         exit_fee = quantity * exit_price * fee_rate
-        entry_cost = quantity * float(trade["entry_price"]) + (
-            float(trade["fees_usdc"]) - quantity * float(trade["entry_price"]) * fee_rate
-        )
+        entry_cost = quantity * float(trade["entry_price"]) + float(trade["fees_usdc"])
         net_pnl = quantity * exit_price - exit_fee - entry_cost
         return net_pnl, exit_price, exit_fee
 
@@ -482,24 +529,75 @@ class PaperTradingEngine:
             (int(candle["open_time"]),),
         ).fetchone()
 
+    @staticmethod
+    def _exit_trigger(
+        trade: sqlite3.Row,
+        snapshot: dict[str, Any],
+        signal: dict[str, Any],
+    ) -> tuple[str, float, bool] | None:
+        stop = float(trade["stop_loss_price"])
+        target = float(trade["take_profit_price"])
+        opened_at = datetime.fromisoformat(
+            str(trade["opened_at"]).replace("Z", "+00:00")
+        )
+        opened_ms = int(opened_at.timestamp() * 1000)
+
+        # Use complete candles that began after entry to catch crossings between
+        # worker iterations. If both brackets trade in one candle, choose the
+        # stop first because OHLC data cannot prove a favorable ordering.
+        for candle in snapshot["candles1m"]:
+            if int(candle["open_time"]) < opened_ms:
+                continue
+            candle_open = float(candle["open"])
+            candle_low = float(candle["low"])
+            candle_high = float(candle["high"])
+            if candle_open <= stop:
+                return "Stop-loss", candle_open, True
+            if candle_open >= target:
+                return "Take-profit", candle_open, False
+            stop_hit = candle_low <= stop
+            target_hit = candle_high >= target
+            if stop_hit:
+                return "Stop-loss", stop, True
+            if target_hit:
+                return "Take-profit", target, False
+
+        current_price = float(snapshot["price"])
+        if current_price <= stop:
+            return "Stop-loss", current_price, True
+        if current_price >= target:
+            return "Take-profit", target, False
+        if signal["direction"] == "SELL":
+            return "Bearish signal", current_price, True
+        return None
+
     def _close_trade(
         self,
         connection: sqlite3.Connection,
         trade: sqlite3.Row,
         market_price: float,
         reason: str,
+        apply_slippage: bool = True,
     ) -> None:
         quantity = float(trade["quantity"])
         slippage_rate = float(trade["slippage_percent"]) / 100.0
         fee_rate = float(trade["fee_percent"]) / 100.0
-        exit_price = market_price * (1.0 - slippage_rate)
+        exit_price = (
+            market_price * (1.0 - slippage_rate)
+            if apply_slippage
+            else market_price
+        )
         exit_notional = quantity * exit_price
         exit_fee = exit_notional * fee_rate
         entry_price = float(trade["entry_price"])
         entry_fee = float(trade["fees_usdc"])
         entry_market_estimate = entry_price / (1.0 + slippage_rate)
         entry_slippage = quantity * max(0.0, entry_price - entry_market_estimate)
-        exit_slippage = quantity * max(0.0, market_price - exit_price)
+        exit_slippage = (
+            quantity * max(0.0, market_price - exit_price)
+            if apply_slippage
+            else 0.0
+        )
         net_pnl = exit_notional - exit_fee - quantity * entry_price - entry_fee
         connection.execute(
             """
@@ -530,11 +628,17 @@ class PaperTradingEngine:
         connection: sqlite3.Connection,
         settings: dict[str, float],
         price: float,
-    ) -> None:
+        entry_candle_open_ms: int,
+    ) -> bool:
         account = connection.execute("SELECT * FROM account WHERE id = 1").fetchone()
         equity, _, current_trade = self._equity(connection, price)
         if current_trade:
-            return
+            return False
+        if connection.execute(
+            "SELECT 1 FROM trades WHERE entry_candle_open_ms = ? LIMIT 1",
+            (entry_candle_open_ms,),
+        ).fetchone():
+            return False
         budget = min(
             equity * settings["positionSizePercent"] / 100.0,
             float(account["cash_usdc"]),
@@ -544,7 +648,7 @@ class PaperTradingEngine:
         entry_price = price * (1.0 + slippage_rate)
         quantity = budget / (entry_price * (1.0 + fee_rate)) if entry_price > 0 else 0.0
         if quantity <= 0:
-            return
+            return False
         entry_notional = quantity * entry_price
         entry_fee = entry_notional * fee_rate
         slippage_cost = quantity * (entry_price - price)
@@ -554,8 +658,10 @@ class PaperTradingEngine:
             """
             INSERT INTO trades (
                 opened_at, entry_price, quantity, fees_usdc, slippage_usdc,
-                status, fee_percent, slippage_percent, stop_loss_price, take_profit_price
-            ) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+                status, fee_percent, slippage_percent, stop_loss_price,
+                take_profit_price, entry_candle_open_ms
+            ) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
             """,
             (
                 iso_utc(),
@@ -567,12 +673,16 @@ class PaperTradingEngine:
                 settings["slippagePercent"],
                 stop_price,
                 target_price,
+                entry_candle_open_ms,
             ),
         )
+        if connection.execute("SELECT changes() AS count").fetchone()["count"] == 0:
+            return False
         connection.execute(
             "UPDATE account SET cash_usdc = cash_usdc - ? WHERE id = 1",
             (entry_notional + entry_fee,),
         )
+        return True
 
     def _status(self, connection: sqlite3.Connection, price: float) -> dict[str, Any]:
         account = connection.execute("SELECT * FROM account WHERE id = 1").fetchone()
@@ -634,76 +744,38 @@ class PaperTradingEngine:
             "exitReason": row["exit_reason"],
         }
 
-    def dashboard(self) -> dict[str, Any]:
-        snapshot = self._market_snapshot()
-        indicators = [
-            calculate_indicators(snapshot["candles1m"], "1m"),
-            calculate_indicators(snapshot["candles5m"], "5m"),
-        ]
-        signal_data = build_signal(indicators[0], indicators[1], snapshot["price"])
-        last_candle = snapshot["candles1m"][-1]
-
-        with self._connect() as connection:
-            self._reset_day_if_needed(connection, snapshot["price"])
-            signal_row = self._record_signal(
-                connection, signal_data, last_candle, snapshot["price"]
+    def _dashboard_data(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: dict[str, Any],
+        indicators: list[dict[str, Any]],
+        signal_row: sqlite3.Row | None,
+    ) -> dict[str, Any]:
+        if signal_row is None:
+            raise MarketDataUnavailable(
+                "The paper market-data worker has not recorded its first signal yet."
             )
-            settings = self._settings(connection)
-            account = connection.execute("SELECT * FROM account WHERE id = 1").fetchone()
-            trade = self._open_trade(connection)
-
-            if trade:
-                exit_reason = None
-                if snapshot["price"] <= float(trade["stop_loss_price"]):
-                    exit_reason = "Stop-loss"
-                elif snapshot["price"] >= float(trade["take_profit_price"]):
-                    exit_reason = "Take-profit"
-                elif signal_data["direction"] == "SELL":
-                    exit_reason = "Bearish signal"
-                if exit_reason:
-                    self._close_trade(connection, trade, snapshot["price"], exit_reason)
-
-            current_status = self._status(connection, snapshot["price"])
-            loss_reached = (
-                current_status["dailyPnlUsdc"] <= -settings["maxDailyLossUsdc"]
-            )
-            if loss_reached:
-                trade = self._open_trade(connection)
-                if trade:
-                    self._close_trade(
-                        connection, trade, snapshot["price"], "Maximum daily loss"
-                    )
-                connection.execute(
-                    "UPDATE account SET running = 0, daily_loss_limit_reached = 1 WHERE id = 1"
-                )
-            elif (
-                bool(account["running"])
-                and not bool(account["daily_loss_limit_reached"])
-                and signal_data["direction"] == "BUY"
-                and self._open_trade(connection) is None
-            ):
-                self._open_position(connection, settings, snapshot["price"])
-
-            status = self._status(connection, snapshot["price"])
-            today = utc_now().date().isoformat()
-            today_start = f"{today}T00:00:00.000Z"
-            today_trade_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) AS count FROM trades WHERE opened_at >= ?",
-                    (today_start,),
-                ).fetchone()["count"]
-            )
-            closed_count = connection.execute(
+        today = utc_now().date().isoformat()
+        today_start = f"{today}T00:00:00.000Z"
+        today_trade_count = int(
+            connection.execute(
+                "SELECT COUNT(*) AS count FROM trades WHERE opened_at >= ?",
+                (today_start,),
+            ).fetchone()["count"]
+        )
+        closed_count = int(
+            connection.execute(
                 "SELECT COUNT(*) AS count FROM trades WHERE status = 'CLOSED'"
             ).fetchone()["count"]
-            winning_count = connection.execute(
+        )
+        winning_count = int(
+            connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM trades
                 WHERE status = 'CLOSED' AND realized_pnl_usdc > 0
                 """
             ).fetchone()["count"]
-            win_rate = (winning_count / closed_count * 100.0) if closed_count else 0.0
-
+        )
         return {
             "market": {
                 "symbol": "SOL/USDC",
@@ -725,14 +797,114 @@ class PaperTradingEngine:
             },
             "indicators": indicators,
             "signal": self._signal_dict(signal_row),
-            "status": status,
-            "settings": settings,
+            "status": self._status(connection, snapshot["price"]),
+            "settings": self._settings(connection),
             "todayTradeCount": today_trade_count,
-            "winRatePercent": win_rate,
+            "winRatePercent": (
+                winning_count / closed_count * 100.0 if closed_count else 0.0
+            ),
         }
 
+    def dashboard(self) -> dict[str, Any]:
+        """Read-only dashboard projection; it never evaluates or mutates trades."""
+        snapshot = self._read_market_snapshot()
+        indicators = [
+            calculate_indicators(snapshot["candles1m"], "1m"),
+            calculate_indicators(snapshot["candles5m"], "5m"),
+        ]
+        with self._session() as connection:
+            signal_row = connection.execute(
+                "SELECT * FROM signals ORDER BY candle_open_ms DESC LIMIT 1"
+            ).fetchone()
+            return self._dashboard_data(connection, snapshot, indicators, signal_row)
+
+    def evaluate(self) -> dict[str, Any]:
+        """Fetch market data and perform one atomic paper-only evaluation."""
+        snapshot = self.market_data.get_snapshot()
+        indicators = [
+            calculate_indicators(snapshot["candles1m"], "1m"),
+            calculate_indicators(snapshot["candles5m"], "5m"),
+        ]
+        signal_data = build_signal(indicators[0], indicators[1], snapshot["price"])
+        last_candle = snapshot["candles1m"][-1]
+
+        with self._session() as connection:
+            self._store_market_snapshot(connection, snapshot)
+            self._reset_day_if_needed(connection, snapshot["price"])
+            signal_row = self._record_signal(
+                connection, signal_data, last_candle, snapshot["price"]
+            )
+            settings = self._settings(connection)
+            account = connection.execute("SELECT * FROM account WHERE id = 1").fetchone()
+
+            trade = self._open_trade(connection)
+            if trade:
+                exit_trigger = self._exit_trigger(trade, snapshot, signal_data)
+                if exit_trigger:
+                    exit_reason, exit_market_price, apply_slippage = exit_trigger
+                    self._close_trade(
+                        connection,
+                        trade,
+                        exit_market_price,
+                        exit_reason,
+                        apply_slippage,
+                    )
+
+            status = self._status(connection, snapshot["price"])
+            loss_reached = (
+                status["dailyPnlUsdc"] <= -settings["maxDailyLossUsdc"]
+            )
+            if loss_reached:
+                trade = self._open_trade(connection)
+                if trade:
+                    self._close_trade(
+                        connection, trade, snapshot["price"], "Maximum daily loss"
+                    )
+                connection.execute(
+                    """
+                    UPDATE account SET running = 0, daily_loss_limit_reached = 1
+                    WHERE id = 1
+                    """
+                )
+            elif (
+                bool(account["running"])
+                and not bool(account["daily_loss_limit_reached"])
+                and signal_data["direction"] == "BUY"
+                and self._open_trade(connection) is None
+            ):
+                opened = self._open_position(
+                    connection,
+                    settings,
+                    snapshot["price"],
+                    int(last_candle["open_time"]),
+                )
+                if opened:
+                    post_entry_status = self._status(connection, snapshot["price"])
+                    if (
+                        post_entry_status["dailyPnlUsdc"]
+                        <= -settings["maxDailyLossUsdc"]
+                    ):
+                        trade = self._open_trade(connection)
+                        if trade:
+                            self._close_trade(
+                                connection,
+                                trade,
+                                snapshot["price"],
+                                "Maximum daily loss",
+                            )
+                        connection.execute(
+                            """
+                            UPDATE account SET running = 0,
+                              daily_loss_limit_reached = 1 WHERE id = 1
+                            """
+                        )
+
+            return self._dashboard_data(
+                connection, snapshot, indicators, signal_row
+            )
+
     def get_settings(self) -> dict[str, float]:
-        with self._connect() as connection:
+        with self._session() as connection:
             return self._settings(connection)
 
     def update_settings(self, payload: dict[str, Any]) -> dict[str, float]:
@@ -754,7 +926,7 @@ class PaperTradingEngine:
             if not minimum <= value <= maximum:
                 raise InvalidRequest(f"{name} must be between {minimum:g} and {maximum:g}.")
 
-        with self._connect() as connection:
+        with self._session() as connection:
             current = self._settings(connection)
             if values["startingBalanceUsdc"] != current["startingBalanceUsdc"]:
                 trades_exist = connection.execute(
@@ -781,25 +953,38 @@ class PaperTradingEngine:
             return self._settings(connection)
 
     def set_running(self, running: bool) -> dict[str, Any]:
-        price = self._market_snapshot()["price"]
-        with self._connect() as connection:
+        with self._session() as connection:
             account = connection.execute("SELECT * FROM account WHERE id = 1").fetchone()
             if running and bool(account["daily_loss_limit_reached"]):
                 raise InvalidRequest(
                     "The daily loss limit was reached. The simulator can resume after the next UTC day begins."
                 )
+            try:
+                snapshot = self._read_market_snapshot(connection)
+                price = float(snapshot["price"])
+            except MarketDataUnavailable:
+                if running:
+                    raise
+                trade = self._open_trade(connection)
+                price = float(trade["entry_price"]) if trade else 0.0
             connection.execute("UPDATE account SET running = ? WHERE id = 1", (int(running),))
             return self._status(connection, price)
 
+    def startup(self) -> dict[str, bool]:
+        """Fail closed: every API process starts with paper entries disabled."""
+        with self._session() as connection:
+            connection.execute("UPDATE account SET running = 0 WHERE id = 1")
+        return {"running": False, "mode": "PAPER"}
+
     def list_signals(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._session() as connection:
             rows = connection.execute(
                 "SELECT * FROM signals ORDER BY id DESC LIMIT 30"
             ).fetchall()
             return [self._signal_dict(row) for row in rows]
 
     def list_trades(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._session() as connection:
             rows = connection.execute(
                 "SELECT * FROM trades ORDER BY id DESC LIMIT 30"
             ).fetchall()
@@ -807,9 +992,15 @@ class PaperTradingEngine:
 
 
 def dispatch(action: str, payload: dict[str, Any]) -> Any:
-    engine = PaperTradingEngine()
+    engine = PaperTradingEngine(
+        read_only=action in {"dashboard", "settings", "signals", "trades"}
+    )
     if action == "dashboard":
         return engine.dashboard()
+    if action == "evaluate":
+        return engine.evaluate()
+    if action == "startup":
+        return engine.startup()
     if action == "settings":
         return engine.get_settings()
     if action == "update_settings":
