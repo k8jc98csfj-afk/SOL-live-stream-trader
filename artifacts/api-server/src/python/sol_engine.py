@@ -109,13 +109,29 @@ class KrakenPublicMarketData:
                 "Could not retrieve live SOL/USDC market data. Check the public market-data connection and try again."
             ) from exc
 
-    def _price(self) -> float:
+    def _ticker(self) -> dict[str, float]:
         payload = self._get_json("Ticker", {"pair": SYMBOL}).get("result", {})
         ticker = payload.get(SYMBOL) or next(iter(payload.values()), {})
         close = ticker.get("c", [])
-        if not close:
-            raise MarketDataUnavailable("Kraken did not return a SOL/USDC ticker price.")
-        return finite_number(close[0], "SOL/USDC price")
+        bid = ticker.get("b", [])
+        ask = ticker.get("a", [])
+        if not close or not bid or not ask:
+            raise MarketDataUnavailable(
+                "Kraken did not return a complete SOL/USDC ticker quote."
+            )
+        quote = {
+            "price": finite_number(close[0], "SOL/USDC last price"),
+            "bid": finite_number(bid[0], "SOL/USDC best bid"),
+            "ask": finite_number(ask[0], "SOL/USDC best ask"),
+        }
+        if (
+            quote["price"] <= 0
+            or quote["bid"] <= 0
+            or quote["ask"] <= 0
+            or quote["bid"] > quote["ask"]
+        ):
+            raise MarketDataUnavailable("Kraken returned an invalid SOL/USDC spread.")
+        return quote
 
     def _candles(self, interval: str) -> list[dict[str, Any]]:
         result = self._get_json(
@@ -152,11 +168,12 @@ class KrakenPublicMarketData:
 
     def get_snapshot(self) -> dict[str, Any]:
         with ThreadPoolExecutor(max_workers=3) as executor:
-            price_job = executor.submit(self._price)
+            ticker_job = executor.submit(self._ticker)
             one_minute_job = executor.submit(self._candles, "1")
             five_minute_job = executor.submit(self._candles, "5")
+            ticker = ticker_job.result()
             return {
-                "price": price_job.result(),
+                **ticker,
                 "candles1m": one_minute_job.result(),
                 "candles5m": five_minute_job.result(),
                 "updatedAt": iso_utc(),
@@ -537,6 +554,7 @@ class PaperTradingEngine:
     ) -> tuple[str, float, bool] | None:
         stop = float(trade["stop_loss_price"])
         target = float(trade["take_profit_price"])
+        bid = float(snapshot.get("bid", snapshot["price"]))
         opened_at = datetime.fromisoformat(
             str(trade["opened_at"]).replace("Z", "+00:00")
         )
@@ -562,13 +580,12 @@ class PaperTradingEngine:
             if target_hit:
                 return "Take-profit", target, False
 
-        current_price = float(snapshot["price"])
-        if current_price <= stop:
-            return "Stop-loss", current_price, True
-        if current_price >= target:
+        if bid <= stop:
+            return "Stop-loss", bid, True
+        if bid >= target:
             return "Take-profit", target, False
         if signal["direction"] == "SELL":
-            return "Bearish signal", current_price, True
+            return "Bearish signal", bid, True
         return None
 
     def _close_trade(
@@ -797,7 +814,9 @@ class PaperTradingEngine:
             },
             "indicators": indicators,
             "signal": self._signal_dict(signal_row),
-            "status": self._status(connection, snapshot["price"]),
+            "status": self._status(
+                connection, float(snapshot.get("bid", snapshot["price"]))
+            ),
             "settings": self._settings(connection),
             "todayTradeCount": today_trade_count,
             "winRatePercent": (
@@ -827,10 +846,11 @@ class PaperTradingEngine:
         ]
         signal_data = build_signal(indicators[0], indicators[1], snapshot["price"])
         last_candle = snapshot["candles1m"][-1]
+        mark_price = float(snapshot.get("bid", snapshot["price"]))
 
         with self._session() as connection:
             self._store_market_snapshot(connection, snapshot)
-            self._reset_day_if_needed(connection, snapshot["price"])
+            self._reset_day_if_needed(connection, mark_price)
             signal_row = self._record_signal(
                 connection, signal_data, last_candle, snapshot["price"]
             )
@@ -850,7 +870,7 @@ class PaperTradingEngine:
                         apply_slippage,
                     )
 
-            status = self._status(connection, snapshot["price"])
+            status = self._status(connection, mark_price)
             loss_reached = (
                 status["dailyPnlUsdc"] <= -settings["maxDailyLossUsdc"]
             )
@@ -858,7 +878,7 @@ class PaperTradingEngine:
                 trade = self._open_trade(connection)
                 if trade:
                     self._close_trade(
-                        connection, trade, snapshot["price"], "Maximum daily loss"
+                        connection, trade, mark_price, "Maximum daily loss"
                     )
                 connection.execute(
                     """
@@ -875,11 +895,11 @@ class PaperTradingEngine:
                 opened = self._open_position(
                     connection,
                     settings,
-                    snapshot["price"],
+                    float(snapshot.get("ask", snapshot["price"])),
                     int(last_candle["open_time"]),
                 )
                 if opened:
-                    post_entry_status = self._status(connection, snapshot["price"])
+                    post_entry_status = self._status(connection, mark_price)
                     if (
                         post_entry_status["dailyPnlUsdc"]
                         <= -settings["maxDailyLossUsdc"]
@@ -889,7 +909,7 @@ class PaperTradingEngine:
                             self._close_trade(
                                 connection,
                                 trade,
-                                snapshot["price"],
+                                mark_price,
                                 "Maximum daily loss",
                             )
                         connection.execute(
@@ -961,7 +981,7 @@ class PaperTradingEngine:
                 )
             try:
                 snapshot = self._read_market_snapshot(connection)
-                price = float(snapshot["price"])
+                price = float(snapshot.get("bid", snapshot["price"]))
             except MarketDataUnavailable:
                 if running:
                     raise

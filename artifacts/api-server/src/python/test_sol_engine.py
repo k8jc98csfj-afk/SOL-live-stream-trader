@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from sol_engine import (
     DEFAULTS,
+    KrakenPublicMarketData,
     PaperTradingEngine,
     build_signal,
     iso_utc,
@@ -62,6 +63,8 @@ def make_snapshot(price: float = 100.0) -> dict:
     candles_1m[-1]["volume"] = 200.0
     return {
         "price": price,
+        "bid": price - 0.01,
+        "ask": price + 0.01,
         "candles1m": candles_1m,
         "candles5m": candles_5m,
         "updatedAt": iso_utc(),
@@ -128,6 +131,24 @@ class SolEngineTests(unittest.TestCase):
             )["direction"],
             "HOLD",
         )
+
+    def test_public_ticker_parses_last_bid_and_ask(self) -> None:
+        market = KrakenPublicMarketData()
+        response = {
+            "error": [],
+            "result": {
+                "SOLUSDC": {
+                    "a": ["100.2", "1", "1"],
+                    "b": ["100.0", "1", "1"],
+                    "c": ["100.1", "0.5"],
+                }
+            },
+        }
+        with patch.object(market, "_get_json", return_value=response):
+            self.assertEqual(
+                market._ticker(),
+                {"price": 100.1, "bid": 100.0, "ask": 100.2},
+            )
 
     def test_new_account_and_startup_are_off(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as connection, connection:
@@ -251,7 +272,8 @@ class SolEngineTests(unittest.TestCase):
         self.assertLess(closed["exitPrice"], stop)
         self.assertAlmostEqual(
             closed["exitPrice"],
-            market_price * (1.0 - DEFAULTS["slippagePercent"] / 100.0),
+            (market_price - 0.01)
+            * (1.0 - DEFAULTS["slippagePercent"] / 100.0),
             places=8,
         )
 
@@ -285,6 +307,33 @@ class SolEngineTests(unittest.TestCase):
             gap_open * (1.0 - DEFAULTS["slippagePercent"] / 100.0),
             places=8,
         )
+
+    def test_ambiguous_candle_that_hits_both_brackets_uses_stop_first(self) -> None:
+        trade = self.seed_open_trade()
+        stop = float(trade["stop_loss_price"])
+        target = float(trade["take_profit_price"])
+        opened_ms = int(
+            datetime.fromisoformat(
+                trade["opened_at"].replace("Z", "+00:00")
+            ).timestamp()
+            * 1000
+        )
+        snapshot = make_snapshot(100.0)
+        snapshot["candles1m"].append(
+            candle(
+                opened_ms + 1,
+                (stop + target) / 2,
+                high=target + 1.0,
+                low=stop - 1.0,
+                close=100.0,
+            )
+        )
+        self.market.snapshot = snapshot
+        with patch("sol_engine.build_signal", return_value=HOLD):
+            self.engine.evaluate()
+        closed = self.engine.list_trades()[0]
+        self.assertEqual(closed["exitReason"], "Stop-loss")
+        self.assertLess(closed["exitPrice"], stop)
 
     def test_take_profit_executes_when_trigger_is_crossed(self) -> None:
         self.seed_open_trade()

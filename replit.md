@@ -36,7 +36,8 @@ Paper-only SOL/USDC scalping dashboard with public market data, 1-minute and 5-m
 - Public Kraken market data is used; the engine fails visibly if the feed is unavailable instead of fabricating fallback prices.
 - Dashboard GETs are read-only. A server-owned worker evaluates paper signals and positions independently.
 - SQLite constraints enforce one open paper position and at most one entry for a given signal candle.
-- Stop exits use adverse slippage and gap-aware fills; take-profit exits model a limit fill at target or candle-open price improvement.
+- Live fills and equity marks use Kraken's public best bid/ask plus configured slippage; closed 1m candles catch missed bracket crossings, with stop-first handling when both levels trade in one candle.
+- Take-profit exits model a limit fill at target or candle-open price improvement; order-book depth and partial fills are not modeled.
 - Only closed candles create signals. Fees, slippage, position sizing, and the daily-loss lock apply to simulated positions.
 
 ## Product
